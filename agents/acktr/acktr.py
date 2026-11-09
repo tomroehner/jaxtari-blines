@@ -1,0 +1,481 @@
+# Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari_envpool_xla_jax_scan.py
+import os
+import random
+import time
+from functools import partial
+from typing import Sequence, NamedTuple
+
+import flax
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
+import numpy as np
+import kfac_jax
+import wandb
+from flax.linen.initializers import constant, orthogonal
+import jaxtari
+from jaxtari.wrappers import NormalizeObservationWrapper, ObjectCentricWrapper, PixelObsWrapper, AtariWrapper, LogWrapper, FlattenObservationWrapper
+from jaxtari import spaces
+from agents.ppo.ppo_eval import evaluate
+from agents.run_utils import eval_mod_configs, log_model_artifact, plan_chunks, rm_metrics
+from agents.networks import impala_cnn
+from agents.occam.occam import OCCAMWrapper, log_occam_comparison_video
+from reward_machines.rm_registry import rm_run_suffix, rm_settings, wrap_reward_machine
+from rtpt import RTPT
+
+def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False, occam_mask=None, reward_machine=None):
+    assert mods is None or isinstance(mods, list), "mods must be None or a list of strings"
+    if mods is not None and len(mods) == 0:
+        mods = None
+    if not eval and mods is not None and len(mods) > 0:
+        print(f"[WARNING] Training on mods {mods}!")
+
+    def thunk():
+        env = jaxtari.make(env_id, mods=mods)
+        env = AtariWrapper(
+                env,
+                sticky_actions=0.0,
+                episodic_life=not eval, # only active during training 
+                first_fire=True,
+                noop_max=30,
+                full_action_space=False,
+        )
+        if pixel_based and occam_mask:
+            # object masks instead of frames; same frame skip, pooling and stacking as PixelObsWrapper
+            env = OCCAMWrapper(env, mask_mode=occam_mask, clip_reward=not eval, game_name=env_id)
+        elif pixel_based:
+            env = PixelObsWrapper(
+                env,
+                do_pixel_resize=True,
+                pixel_resize_shape=(84, 84),
+                grayscale=True,
+                use_native_downscaling=native_downscaling,
+                smooth_image=False,
+                frame_stack_size=4,
+                frame_skip=4,
+                max_pooling=True,
+                clip_reward=not eval,
+            )
+        else:
+            env = FlattenObservationWrapper(
+                NormalizeObservationWrapper(
+                    ObjectCentricWrapper(
+                        env,
+                        frame_stack_size=4,
+                        frame_skip=4,
+                        clip_reward=not eval,
+                    )
+                )
+            )
+        if reward_machine is not None:
+            # RM reward (game reward in eval) and the RM state appended to the observation
+            env = wrap_reward_machine(env, env_id, eval=eval, **reward_machine)
+        env = LogWrapper(env)
+        return env
+    return thunk
+
+
+
+class Network(nn.Module):
+    cnn_type: str = "nature"
+
+    @nn.compact
+    def __call__(self, x):
+        if self.cnn_type == "impala":
+            x = impala_cnn(x, kernel_init=orthogonal(np.sqrt(2)))
+        else:
+            x = jnp.transpose(x, (0, 2, 3, 1))
+            x = x / 255.0
+            x = nn.relu(nn.Conv(32, (8, 8), (4, 4), padding="VALID",
+                        kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x))
+            x = nn.relu(nn.Conv(64, (4, 4), (2, 2), padding="VALID",
+                        kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x))
+            x = nn.relu(nn.Conv(64, (3, 3), (1, 1), padding="VALID",
+                        kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x))
+            x = x.reshape((x.shape[0], -1))
+        x = nn.relu(nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x))
+        return x
+
+class MLP_Network(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        # 1. Hidden Layer
+        x = nn.Dense(
+            461,  # Hidden size H=461
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0)
+        )(x)
+        x = nn.relu(x)
+
+        # 2. Output Layer (matches the last layer of the CNN)
+        x = nn.Dense(
+            512,  # Output size
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0)
+        )(x)
+        x = nn.relu(x)  # The CNN's last layer also has a ReLU
+        return x
+
+class Critic(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(1, kernel_init=orthogonal(1), bias_init=constant(0.0))(x)
+
+
+class Actor(nn.Module):
+    action_dim: Sequence[int]
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
+
+
+class AgentParams(NamedTuple):
+    network_params: flax.core.FrozenDict
+    actor_params: flax.core.FrozenDict
+    critic_params: flax.core.FrozenDict
+
+
+@flax.struct.dataclass
+class Storage:
+    obs: jnp.array
+    actions: jnp.array
+    logprobs: jnp.array
+    dones: jnp.array
+    values: jnp.array
+    advantages: jnp.array
+    returns: jnp.array
+    rewards: jnp.array
+
+def single_run(config: dict):
+    config = {k.upper(): v for k, v in config.items() if k != "alg"}
+    pixel_based = config["PIXEL_BASED"]
+    env_id = config["ENV_ID"]
+
+    run_name = f"{env_id}_{config['EXP_NAME']}_{'oc' + rm_run_suffix(config) if not pixel_based else 'pixel' + ('_occam-' + config['OCCAM_MASK'] if config.get('OCCAM_MASK') else '') + ('_impala' if config.get('CNN_TYPE', 'nature') == 'impala' else '')}_{config['SEED']}"
+    wandb.init(
+        project=config.get("PROJECT", "jaxtari-blines"),
+        entity=config.get("ENTITY", None),
+        config=config,
+        name=run_name,
+        save_code=True,
+        mode=config.get("WANDB_MODE", "online"),
+    )
+    wandb.define_metric("*", step_metric="charts/global_step")
+
+    # do not modify the seeding
+    random.seed(config["SEED"])
+    np.random.seed(config["SEED"])
+    key = jax.random.PRNGKey(config["SEED"])
+
+    num_envs = config["NUM_ENVS"]
+    num_steps = config["NUM_STEPS"]
+
+    env = make_env(env_id, list(config.get("TRAIN_MODS") or []), pixel_based, config.get("NATIVE_DOWNSCALING", True), False, occam_mask=config.get("OCCAM_MASK") if config["PIXEL_BASED"] else None, reward_machine=rm_settings(config))()
+    assert isinstance(env.action_space(), spaces.Discrete), "only discrete action space is supported"
+    action_dim = env.action_space().n
+    obs_shape = env.observation_space().shape
+    if pixel_based:
+        obs_shape = obs_shape[:-1]  # drop the trailing grayscale channel
+
+    batch_size = num_envs * num_steps
+    scan_steps, num_chunks, steps_per_chunk = plan_chunks(config["TOTAL_TIMESTEPS"], batch_size, config.get("SCAN_STEPS", 1000))
+    num_updates = scan_steps * num_chunks
+
+    def reset_envs(rng):
+        obs, state = jax.vmap(env.reset)(rng)
+        return obs.reshape(num_envs, *obs_shape), state
+
+    def step_envs(state, action):
+        obs, state, reward, terminated, truncated, info = jax.vmap(env.step)(state, action)
+        done = jnp.logical_or(terminated, truncated)
+        return obs.reshape(num_envs, *obs_shape), state, reward, done, info
+
+    def linear_schedule(count):
+        # anneal learning rate linearly after one update which contains
+        # (NUM_MINIBATCHES * UPDATE_EPOCHS) gradient steps
+        frac = 1.0 - (count / num_updates)
+        return config["LEARNING_RATE"] * frac
+
+    network = Network(cnn_type=config.get("CNN_TYPE", "nature")) if pixel_based else MLP_Network()
+    actor = Actor(action_dim=action_dim)
+    critic = Critic()
+
+    # same root split as dqn/c51/pqn, so env resets for a given seed match across agents
+    key, init_key = jax.random.split(key, 2)
+    network_key, actor_key, critic_key = jax.random.split(init_key, 3)
+    network_params = network.init(network_key, jnp.zeros((1, *obs_shape)))
+    hidden_example = network.apply(network_params, jnp.zeros((1, *obs_shape)))
+    
+    agent_params = AgentParams(
+        network_params=network_params,
+        actor_params=actor.init(actor_key, hidden_example),
+        critic_params=critic.init(critic_key, hidden_example),
+    )
+
+    def get_action_and_value(params, obs, key):
+        """sample action, calculate value and logprob"""
+        hidden = network.apply(params.network_params, obs)
+        logits = actor.apply(params.actor_params, hidden)
+        # sample action: Gumbel-softmax trick
+        # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
+        key, subkey = jax.random.split(key)
+        u = jax.random.uniform(subkey, shape=logits.shape)
+        action = jnp.argmax(logits - jnp.log(-jnp.log(u)), axis=1)
+        logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
+        value = critic.apply(params.critic_params, hidden)
+        return action, logprob, value.squeeze(1), key
+
+    def a2c_loss(params, batch):
+        x, a, advantages, returns = batch
+        
+        hidden = network.apply(params.network_params, x)
+        logits = actor.apply(params.actor_params, hidden)
+        value = critic.apply(params.critic_params, hidden).squeeze()
+
+        kfac_jax.register_softmax_cross_entropy_loss(logits, weight=1.0)
+        kfac_jax.register_squared_error_loss(value[..., None], weight=config["VF_COEF"])
+
+        logprob = jax.nn.log_softmax(logits)[jnp.arange(a.shape[0]), a]
+        # normalize the logits https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
+        logits_norm = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
+        logits_norm = logits_norm.clip(min=jnp.finfo(logits_norm.dtype).min)
+        p_log_p = logits_norm * jax.nn.softmax(logits_norm)
+        entropy = -p_log_p.sum(-1)
+
+        if config["NORM_ADV"]:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Policy loss
+        pg_loss = -(logprob * advantages).mean()
+
+        # Value loss
+        v_loss = 0.5 * ((value - returns) ** 2).mean()
+
+        entropy_loss = entropy.mean()
+        loss = pg_loss - config["ENT_COEF"] * entropy_loss + v_loss * config["VF_COEF"]
+        return loss, (pg_loss, v_loss, entropy_loss)
+
+    optimizer = kfac_jax.Optimizer(
+        value_and_grad_func=jax.value_and_grad(a2c_loss, has_aux=True),
+        l2_reg=0.0,
+        value_func_has_aux=True,
+        value_func_has_rng=False,
+        use_adaptive_learning_rate=False,
+        learning_rate_schedule=linear_schedule if config["ANNEAL_LR"] else lambda s: config["LEARNING_RATE"],
+        momentum_schedule=lambda step: 0.0,
+        damping_schedule=lambda step: 0.001,
+        num_burnin_steps=0,
+        norm_constraint=config["MAX_GRAD_NORM"],
+        inverse_update_period=1,
+        multi_device=False
+    )
+
+    dummy_batch = (
+        jnp.zeros((batch_size, *obs_shape)),
+        jnp.zeros((batch_size,), dtype=jnp.int32),
+        jnp.zeros((batch_size,)),
+        jnp.zeros((batch_size,))
+    )
+    opt_state = optimizer.init(agent_params, jax.random.PRNGKey(0), dummy_batch)
+
+    obs, env_state = reset_envs(jax.random.split(key, num_envs))
+    carry = (
+        env_state,
+        obs,
+        jnp.zeros(num_envs, dtype=jnp.bool_),  # done flags of the last step
+        key,
+    )
+    global_step = 0
+
+    @jax.jit
+    def collect_rollout_and_gae(params, env_state, obs, last_done, key):
+        """One rollout of num_steps per env and GAE."""
+        def rollout_step(c, _):
+            env_state, last_obs, last_done, key = c
+            action, logprob, value, key = get_action_and_value(params, last_obs, key)
+            next_obs, next_state, reward, next_done, info = step_envs(env_state, action)
+            storage = Storage(
+                obs=last_obs,
+                actions=action,
+                logprobs=logprob,
+                dones=last_done,
+                values=value,
+                rewards=reward,
+                returns=jnp.zeros_like(reward),
+                advantages=jnp.zeros_like(reward),
+            )
+            return (next_state, next_obs, next_done, key), (storage, info)
+
+        (env_state, next_obs, next_done, key), (storage, infos) = jax.lax.scan(
+            rollout_step, (env_state, obs, last_done, key), None, length=num_steps
+        )
+
+        # GAE, computed backwards through the rollout
+        next_value = critic.apply(
+            params.critic_params, network.apply(params.network_params, next_obs)
+        ).squeeze(1)
+        dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0).astype(jnp.float32)
+        values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
+
+        def gae_step(advantages, inp):
+            nextdone, nextvalues, curvalues, reward = inp
+            nextnonterminal = 1.0 - nextdone
+            delta = reward + config["GAMMA"] * nextvalues * nextnonterminal - curvalues
+            advantages = delta + config["GAMMA"] * config["GAE_LAMBDA"] * nextnonterminal * advantages
+            return advantages, advantages
+
+        _, advantages = jax.lax.scan(
+            gae_step, jnp.zeros((num_envs,)), (dones[1:], values[1:], values[:-1], storage.rewards), reverse=True
+        )
+        storage = storage.replace(advantages=advantages, returns=advantages + storage.values)
+
+        flat = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), storage)
+        batch = (flat.obs, flat.actions, flat.advantages, flat.returns)
+        return (env_state, next_obs, next_done, key), batch, infos
+
+    def train_chunk(carry, params, opt_state, global_step):
+        infos_list, losses_list, lr_list = [], [], []
+        
+        for _ in range(scan_steps):
+            carry, batch, infos = collect_rollout_and_gae(params, carry[0], carry[1], carry[2], carry[3])
+            
+            update_key, key = jax.random.split(carry[3])
+            # carry = (env_state, next_obs, next_done, key)
+            carry = (carry[0], carry[1], carry[2], key)
+            
+            params, opt_state, stats = optimizer.step(
+                params=params,
+                state=opt_state,
+                rng=update_key,
+                batch=batch
+            )
+            
+            loss = stats.get('loss', jnp.array(0.0))
+            pg_loss, v_loss, entropy_loss = stats.get('aux', (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)))
+            learning_rate = linear_schedule(global_step // batch_size) if config["ANNEAL_LR"] else config["LEARNING_RATE"]
+            
+            infos_list.append(infos)
+            losses_list.append((loss, pg_loss, v_loss, entropy_loss))
+            lr_list.append(learning_rate)
+            global_step += batch_size
+
+        stacked_infos = jax.tree.map(lambda *args: jnp.stack(args), *infos_list)
+        stacked_losses = jax.tree.map(lambda *args: jnp.stack(args), *losses_list)
+        stacked_lrs = jnp.stack(lr_list)
+        
+        return carry, params, opt_state, global_step, (stacked_infos, stacked_losses, stacked_lrs)
+
+    def save_and_eval(params, step_count, final=False):
+        if config.get("SAVE_PATH") is not None:
+            save_dir = os.path.join(config["SAVE_PATH"], run_name)
+            os.makedirs(save_dir, exist_ok=True)
+            model_path = os.path.join(save_dir, f'{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model')
+            with open(model_path, "wb") as f:
+                f.write(
+                    flax.serialization.to_bytes(
+                        [config, [params.network_params, params.actor_params, params.critic_params]]
+                    )
+                )
+            print(f"model saved to {model_path}")
+            if final and config.get("WANDB_SAVE_MODEL", False):
+                log_model_artifact(model_path, run_name)
+
+        print(f"running evaluation at step {step_count}...")
+        metrics = {}
+        for mods_cfg, mod_label in eval_mod_configs(config):
+            episodic_returns, env_states = evaluate(
+                params,
+                partial(
+                    make_env,
+                    mods=mods_cfg,
+                    pixel_based=pixel_based,
+                    native_downscaling=config.get("NATIVE_DOWNSCALING", True),
+                    eval=True,
+                    occam_mask=config.get("OCCAM_MASK") if config["PIXEL_BASED"] else None,
+                    reward_machine=rm_settings(config),
+                ),
+                env_id,
+                eval_episodes=10,
+                Model=(partial(Network, cnn_type=config.get("CNN_TYPE", "nature")), Actor) if pixel_based else (MLP_Network, Actor),
+                seed=config["SEED"] + 42,  # use a different seed for evaluation
+            )
+            metrics[mod_label] = float(np.mean(jax.device_get(episodic_returns)))
+            wandb.log({f"eval/episodic_return_{mod_label}": metrics[mod_label]}, step=step_count)
+
+            if config.get("CAPTURE_VIDEO", False):
+                # Instantiate a clean renderer immune to the training env's downscaling
+                clean_renderer = jaxtari.make(env_id, mods=mods_cfg).renderer
+                video_states = jax.tree.map(lambda x: x[: config.get("VIDEO_MAX_FRAMES")], env_states)
+                frames = jnp.transpose(jax.vmap(clean_renderer.render)(video_states), (0, 3, 1, 2))
+                video = wandb.Video(np.array(frames), fps=30, format="mp4")
+                wandb.log({f"eval/video_{mod_label}": video}, step=step_count)
+                print(f"Video (eval) logged to wandb with {frames.shape[0]} frames ({mod_label}).")
+                if config["PIXEL_BASED"] and config.get("OCCAM_MASK"):
+                    log_occam_comparison_video(config["ENV_ID"], config["OCCAM_MASK"], env_states,
+                                               mods=mods_cfg, mod_label=mod_label, step=step_count)
+        return metrics
+
+    print("[acktr] start compile...")
+    compile_start = time.perf_counter()
+    # compile the rollout and GAE collection function
+    collect_rollout_and_gae.lower(agent_params, carry[0], carry[1], carry[2], carry[3]).compile()
+    # dummy optimizer step to trigger compilation
+    dummy_params = jax.tree.map(lambda x: jnp.array(x, copy=True), agent_params)
+    dummy_opt_state = jax.tree.map(lambda x: jnp.array(x, copy=True), opt_state)
+    _, _, _ = optimizer.step(
+        params=dummy_params, 
+        state=dummy_opt_state, 
+        rng=jax.random.PRNGKey(0), 
+        batch=dummy_batch
+    )
+    print(f"[acktr] compilation time: {time.perf_counter() - compile_start:.2f}s")
+
+    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=num_chunks)
+    rtpt.start()
+    run_time = time.perf_counter()
+    print(f"[acktr] starting training: {num_chunks} chunks x {steps_per_chunk} env steps")
+    for chunk in range(num_chunks):
+        rtpt.step()
+        if config["EVAL_DURING_TRAIN"] and chunk > 0 and chunk % config["EVAL_EVERY"] == 0:
+            save_and_eval(agent_params, global_step)
+
+        chunk_start = time.perf_counter()
+        carry, agent_params, opt_state, global_step, (infos, (loss, pg_loss, v_loss, entropy_loss), learning_rate) = train_chunk(
+            carry, agent_params, opt_state, global_step
+        )
+        
+        # one wandb point per update of the chunk, not only its last one
+        update_metrics = {
+            "charts/avg_episodic_return": infos["returned_episode_returns"].mean(axis=(1, 2)),
+            "charts/avg_episodic_length": infos["returned_episode_lengths"].mean(axis=(1, 2)),
+            "charts/learning_rate": learning_rate,
+            "losses/value_loss": v_loss,
+            "losses/policy_loss": pg_loss,
+            "losses/entropy": entropy_loss,
+            "losses/loss": loss,
+        }
+        update_metrics = {k: np.asarray(v) for k, v in update_metrics.items()}
+        for i in range(scan_steps - 1):
+            step = global_step - (scan_steps - 1 - i) * batch_size
+            wandb.log({**{k: float(v[i]) for k, v in update_metrics.items()}, "charts/global_step": step}, step=step)
+        metrics = {
+            **{k: float(v[-1]) for k, v in update_metrics.items()},
+            "charts/SPS": int(global_step / (time.perf_counter() - run_time)),
+            "charts/SPS_update": int(steps_per_chunk / (time.perf_counter() - chunk_start)),
+            "charts/time": time.perf_counter() - run_time,
+            "charts/global_step": global_step,
+        }
+        metrics.update(rm_metrics(infos))
+        wandb.log(metrics, step=global_step)
+        print(
+            f"[acktr] chunk {chunk + 1}/{num_chunks} | global_step {global_step} | "
+            f"avg_return {metrics['charts/avg_episodic_return']:.2f} | "
+            f"avg_length {metrics['charts/avg_episodic_length']:.2f} | "
+            f"loss {metrics['losses/loss']:.4f} | entropy {metrics['losses/entropy']:.4f} | "
+            f"SPS {metrics['charts/SPS']}"
+        )
+
+    eval_metrics = save_and_eval(agent_params, global_step + 1, final=True)
+    wandb.finish()
+    return eval_metrics

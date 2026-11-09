@@ -61,6 +61,8 @@ def main(config):
             from agents.dreamerv3.dreamerv3 import single_run
         elif alg == "A2C":
             from agents.a2c.a2c import single_run
+        elif alg == "ACKTR":
+            from agents.acktr.acktr import single_run
         else:
             raise ValueError(f"Unknown ALG: {alg}")
 
