@@ -59,6 +59,8 @@ def main(config):
             from agents.ppo_crl.ppo_crl import single_run
         elif alg == "DREAMERV3":
             from agents.dreamerv3.dreamerv3 import single_run
+        elif alg == "A2C":
+            from agents.a2c.a2c import single_run
         else:
             raise ValueError(f"Unknown ALG: {alg}")
 
