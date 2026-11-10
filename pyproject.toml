@@ -11,6 +11,7 @@ dependencies = [
     "hydra-core>=1.3.2",
     "jax[cuda12]", # use "jax" if no cuda available
     "flashbax",
+    "kfac-jax",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,7 @@ viper = ["scikit-learn"]
 [tool.uv.sources]
 # local checkout (../JAXtari, kept on dev); editable so runs always use its current HEAD
 jaxtari = { path = "../JAXtari", editable = true }
+kfac-jax = { git = "https://github.com/google-deepmind/kfac-jax.git" }
 
 [tool.uv]
 override-dependencies = [
