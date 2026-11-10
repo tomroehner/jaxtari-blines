@@ -8,7 +8,7 @@ TOTAL_TIMESTEPS: 10000000
 LEARNING_RATE: 1.0
 NUM_ENVS: 8
 NUM_STEPS: 128
-SCAN_STEPS: 10 # updates per jitted chunk (every update is logged); ~10% faster than 1 here, drops <=5 of ~2.4k-9.8k updates
+SCAN_STEPS: 10  # updates per chunk (every update is logged)
 ANNEAL_LR: True
 GAMMA: 0.99
 GAE_LAMBDA: 0.95

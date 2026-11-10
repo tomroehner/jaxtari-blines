@@ -248,17 +248,17 @@ def single_run(config: dict):
         value = critic.apply(params.critic_params, hidden).squeeze()
         return logprob, entropy, value
 
-    def a2c_loss(params, x, a, mb_advantages, mb_returns):
+    def a2c_loss(params, x, a, advantages, returns):
         newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
 
         if config["NORM_ADV"]:
-            mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # Policy loss
-        pg_loss = -(newlogprob * mb_advantages).mean()
+        pg_loss = -(newlogprob * advantages).mean()
 
         # Value loss
-        v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
+        v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
 
         entropy_loss = entropy.mean()
         loss = pg_loss - config["ENT_COEF"] * entropy_loss + v_loss * config["VF_COEF"]
