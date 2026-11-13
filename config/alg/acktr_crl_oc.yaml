@@ -1,0 +1,43 @@
+ALG: ACKTR_CRL
+EXP_NAME: acktr_crl
+
+CAPTURE_VIDEO: False
+VIDEO_AT_END: True  # True: capture videos only at the end of training on a task
+
+EVAL_DURING_TRAIN: True
+EVAL_EVERY: 102
+EVAL_EPISODES: 10  # per seen task; BWT/FM are differences of evals
+
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True
+
+LEARNING_RATE: 1.0
+NUM_ENVS: 512
+NUM_STEPS: 64
+SCAN_STEPS: 1  # updates per jitted chunk (one wandb log per update)
+ANNEAL_LR: True
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+NORM_ADV: True
+ENT_COEF: 0.01
+VF_COEF: 0.5
+MAX_GRAD_NORM: 0.001
+
+# =================================================================
+# CL Specific Configs
+# =================================================================
+
+TASKS: [pong, pong, pong] # replaces ENV_ID
+TIMESTEPS_PER_TASK: 10000000  # replaces TOTAL_TIMESTEPS
+
+# mods applied during training, one list per task
+TASK_TRAIN_MODS: 
+  - []
+  - [lazy_enemy]
+  - [shift_player]
+
+# mod lists each task is evaluated on (default: its train mods)
+TASK_EVAL_MODS: 
+  - [ [] ]
+  - [ [lazy_enemy] ]
+  - [ [shift_player] ]

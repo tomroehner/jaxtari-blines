@@ -63,6 +63,8 @@ def main(config):
             from agents.a2c.a2c import single_run
         elif alg == "ACKTR":
             from agents.acktr.acktr import single_run
+        elif alg == "ACKTR_CRL":
+            from agents.acktr_crl.acktr_crl import single_run
         else:
             raise ValueError(f"Unknown ALG: {alg}")
 
