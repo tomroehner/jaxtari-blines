@@ -163,34 +163,34 @@ def single_run(config: dict):
         return action, logprob, value.squeeze(1), key
 
     def a2c_loss(params, batch):
-            x, a, advantages, returns = batch
-            
-            hidden = network.apply(params.network_params, x)
-            logits = actor.apply(params.actor_params, hidden)
-            value = critic.apply(params.critic_params, hidden).squeeze()
-    
-            kfac_jax.register_softmax_cross_entropy_loss(logits, weight=1.0)
-            kfac_jax.register_squared_error_loss(value[..., None], weight=config["VF_COEF"])
-    
-            logprob = jax.nn.log_softmax(logits)[jnp.arange(a.shape[0]), a]
-            # normalize the logits https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
-            logits_norm = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
-            logits_norm = logits_norm.clip(min=jnp.finfo(logits_norm.dtype).min)
-            p_log_p = logits_norm * jax.nn.softmax(logits_norm)
-            entropy = -p_log_p.sum(-1)
-    
-            if config["NORM_ADV"]:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-    
-            # Policy loss
-            pg_loss = -(logprob * advantages).mean()
-    
-            # Value loss
-            v_loss = 0.5 * ((value - returns) ** 2).mean()
-    
-            entropy_loss = entropy.mean()
-            loss = pg_loss - config["ENT_COEF"] * entropy_loss + v_loss * config["VF_COEF"]
-            return loss, (pg_loss, v_loss, entropy_loss)
+        x, a, advantages, returns = batch
+        
+        hidden = network.apply(params.network_params, x)
+        logits = actor.apply(params.actor_params, hidden)
+        value = critic.apply(params.critic_params, hidden).squeeze()
+
+        kfac_jax.register_softmax_cross_entropy_loss(logits, weight=1.0)
+        kfac_jax.register_squared_error_loss(value[..., None], weight=config["VF_COEF"])
+
+        logprob = jax.nn.log_softmax(logits)[jnp.arange(a.shape[0]), a]
+        # normalize the logits https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
+        logits_norm = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
+        logits_norm = logits_norm.clip(min=jnp.finfo(logits_norm.dtype).min)
+        p_log_p = logits_norm * jax.nn.softmax(logits_norm)
+        entropy = -p_log_p.sum(-1)
+
+        if config["NORM_ADV"]:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Policy loss
+        pg_loss = -(logprob * advantages).mean()
+
+        # Value loss
+        v_loss = 0.5 * ((value - returns) ** 2).mean()
+
+        entropy_loss = entropy.mean()
+        loss = pg_loss - config["ENT_COEF"] * entropy_loss + v_loss * config["VF_COEF"]
+        return loss, (pg_loss, v_loss, entropy_loss)
 
     optimizer = kfac_jax.Optimizer(
         value_and_grad_func=jax.value_and_grad(a2c_loss, has_aux=True),
