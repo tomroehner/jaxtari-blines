@@ -70,10 +70,19 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
     return thunk
 
 
+def init_cl_state(cl_method, params, estimator_state):
+    if cl_method == "ewc":
+        return {
+            "params": jax.tree.map(jnp.zeros_like, params),
+            "estimator_state": jax.tree.map(jnp.zeros_like, estimator_state),
+        }
+    return {}
+
+
 def single_run(config: dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
     pixel_based = config["PIXEL_BASED"]
-
+    cl_method = config["CL_METHOD"].lower()
     tasks = list(config["TASKS"])
     num_tasks = len(tasks)
     # mods per task: TASK_TRAIN_MODS[i] is the list trained on in task i,
@@ -144,10 +153,10 @@ def single_run(config: dict):
     hidden_example = network.apply(network_params, jnp.zeros((1, *obs_shape)))
     
     agent_params = AgentParams(
-            network_params=network_params,
-            actor_params=actor.init(actor_key, hidden_example),
-            critic_params=critic.init(critic_key, hidden_example),
-        )
+        network_params=network_params,
+        actor_params=actor.init(actor_key, hidden_example),
+        critic_params=critic.init(critic_key, hidden_example),
+    )
 
     def get_action_and_value(params, obs, key):
         """sample action, calculate value and logprob"""
@@ -162,13 +171,65 @@ def single_run(config: dict):
         value = critic.apply(params.critic_params, hidden)
         return action, logprob, value.squeeze(1), key
 
-    def a2c_loss(params, batch):
+    def curvature_estimator_loss(params, batch):
+        """Exists only register the losses with the curvature estimator for EWC"""
+        x, _, _, _ = batch
+        hidden = network.apply(params.network_params, x)
+        logits = actor.apply(params.actor_params, hidden)
+        value = critic.apply(params.critic_params, hidden).squeeze()
+
+        kfac_jax.register_softmax_cross_entropy_loss(logits, weight=1.0)
+        kfac_jax.register_squared_error_loss(value[..., None], weight=config["VF_COEF"])
+        return jnp.sum(logits) + jnp.sum(value) # never used
+
+    # Exists only to get access to the .multiply() method for the EWC penalty
+    ewc_estimator = kfac_jax.BlockDiagonalCurvature(
+        func=curvature_estimator_loss,
+        params_index=0,
+    )
+
+    def a2c_loss(params, batch_and_cl_state):
+
+        def kfac_ewc_penalty(estimator: kfac_jax.BlockDiagonalCurvature, params, cl_state):
+            old_params = cl_state["params"]
+
+            delta = AgentParams(
+                network_params=jax.tree_util.tree_map(lambda p, p_old: p - p_old, params.network_params, old_params.network_params),
+                actor_params=jax.tree_util.tree_map(lambda p, p_old: p - p_old, params.actor_params, old_params.actor_params),
+                critic_params=jax.tree_util.tree_map(lambda p, p_old: p - p_old, params.critic_params, old_params.critic_params),   # restrict the critic
+                # critic_params=jax.tree_util.tree_map(jnp.zeros_like, params.critic_params),   # don't restrict the critic
+            )
+
+            # Compute F * Δθ
+            f_delta = estimator.multiply(
+                state=cl_state["estimator_state"],  # includes all past tasks
+                parameter_structured_vector=delta,
+                identity_weight=0.0,    # no damping
+                exact_power=True,       # only need F to the power of one anyways
+                use_cached=False,
+                pmap_axis_name=None,    # single device
+            )
+
+            # Compute the dot product (Δθ)^T * F * Δθ layer by layer
+            layer_terms = jax.tree.map(
+                lambda d, f_d: jnp.sum(d * f_d),
+                (delta.network_params, delta.actor_params, delta.critic_params),
+                (f_delta.network_params, f_delta.actor_params, f_delta.critic_params)
+            )
+            unnormalized_penalty = sum(jax.tree.leaves(layer_terms))
+
+            # Normalize by the number of restricted parameters
+            num_restrict_params = sum(x.size for x in jax.tree.leaves((params.network_params, params.actor_params, params.critic_params)))
+            return 0.5 * unnormalized_penalty / num_restrict_params
+        
+        batch, cl_state = batch_and_cl_state
         x, a, advantages, returns = batch
         
         hidden = network.apply(params.network_params, x)
         logits = actor.apply(params.actor_params, hidden)
         value = critic.apply(params.critic_params, hidden).squeeze()
 
+        # FIM is computed over joint distribution of actor and critic (actor and critic outputs assumed conditionally independent)
         kfac_jax.register_softmax_cross_entropy_loss(logits, weight=1.0)
         kfac_jax.register_squared_error_loss(value[..., None], weight=config["VF_COEF"])
 
@@ -189,8 +250,12 @@ def single_run(config: dict):
         v_loss = 0.5 * ((value - returns) ** 2).mean()
 
         entropy_loss = entropy.mean()
+
+        cl_loss = kfac_ewc_penalty(ewc_estimator, params, cl_state) if cl_method == "ewc" else jnp.float32(0.0)
+
         loss = pg_loss - config["ENT_COEF"] * entropy_loss + v_loss * config["VF_COEF"]
-        return loss, (pg_loss, v_loss, entropy_loss)
+        loss = loss + config.get("EWC_LAMBDA", 0.0) * cl_loss
+        return loss, (pg_loss, v_loss, entropy_loss, cl_loss)
 
     optimizer = kfac_jax.Optimizer(
         value_and_grad_func=jax.value_and_grad(a2c_loss, has_aux=True),
@@ -261,7 +326,7 @@ def single_run(config: dict):
             batch = (flat.obs, flat.actions, flat.advantages, flat.returns)
             return (env_state, next_obs, next_done, key), batch, infos
 
-        def train_chunk(carry, params, opt_state, global_step):
+        def train_chunk(carry, params, opt_state, global_step, cl_state):
             infos_list, losses_list, lr_list = [], [], []
             
             for _ in range(scan_steps):
@@ -270,20 +335,22 @@ def single_run(config: dict):
                 update_key, key = jax.random.split(carry[3])
                 # carry: (env_state, next_obs, next_done, key)
                 carry = (carry[0], carry[1], carry[2], key)
+
+                extended_batch = (batch, cl_state)
                 
                 params, opt_state, stats = optimizer.step(
                     params=params,
                     state=opt_state,
                     rng=update_key,
-                    batch=batch
+                    batch=extended_batch,
                 )
                 
                 loss = stats.get('loss', jnp.array(0.0))
-                pg_loss, v_loss, entropy_loss = stats.get('aux', (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)))
+                pg_loss, v_loss, entropy_loss, cl_loss = stats.get('aux', (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)))
                 learning_rate = linear_schedule(opt_state.step_counter) if config["ANNEAL_LR"] else config["LEARNING_RATE"]
                 
                 infos_list.append(infos)
-                losses_list.append((loss, pg_loss, v_loss, entropy_loss))
+                losses_list.append((loss, pg_loss, v_loss, entropy_loss, cl_loss))
                 lr_list.append(learning_rate)
                 global_step += batch_size
     
@@ -295,6 +362,27 @@ def single_run(config: dict):
 
         return jax.jit(reset_envs), rollout, train_chunk
 
+    def on_task_end(task_idx, cl_state, params, opt_state):
+        """Update the CL state at the end of each task"""
+        if cl_method == "ewc":
+            new_anchor = jax.tree.map(jnp.copy, params)
+
+            ewc_decay = 0.0 if task_idx == 0 else config["EWC_DECAY"]
+
+            def update_fisher(old, new):
+                return ewc_decay * old + (1.0 - ewc_decay) * new
+
+            new_estimator = jax.tree.map(
+                update_fisher,
+                cl_state["estimator_state"],
+                opt_state.estimator_state
+            )
+
+            cl_state = {
+                "params": new_anchor,
+                "estimator_state": new_estimator,
+            }
+        return cl_state
 
     # --- evaluation on every task seen so far ---------------------------------
     seen_tasks = []          # (task index (1-based), game, train mods, eval mods)
@@ -372,17 +460,29 @@ def single_run(config: dict):
         jnp.zeros((batch_size,)),
         jnp.zeros((batch_size,))
     )
+
+    ewc_state = ewc_estimator.init(
+        func_args=(agent_params, dummy_batch),
+        rng=jax.random.PRNGKey(0),
+        exact_powers_to_cache=None,
+        approx_powers_to_cache=None
+    )
+
+    cl_state = init_cl_state(cl_method, agent_params, ewc_state)
+
+    extended_dummy_batch = (dummy_batch, cl_state)
     # Initialize once to get a valid opt_state
-    opt_state = optimizer.init(agent_params, jax.random.PRNGKey(0), dummy_batch)
+    opt_state = optimizer.init(agent_params, jax.random.PRNGKey(0), extended_dummy_batch)
 
     print("[acktr_crl] compiling K-FAC optimizer step...")
     dummy_params = jax.tree.map(lambda x: jnp.array(x, copy=True), agent_params)
     dummy_opt_state = jax.tree.map(lambda x: jnp.array(x, copy=True), opt_state)
+
     _, _, _ = optimizer.step(
         params=dummy_params, 
         state=dummy_opt_state, 
         rng=jax.random.PRNGKey(0), 
-        batch=dummy_batch
+        batch=extended_dummy_batch
     )
 
     # --- train the tasks in sequence -----------------------------------------
@@ -398,7 +498,7 @@ def single_run(config: dict):
             print(f"[WARNING] Training on mods {task_train_mods[i]}!")
 
         # reset the optimizer state (step count & Kronecker Factor EMAs) for every new task
-        opt_state = optimizer.init(agent_params, jax.random.PRNGKey(config["SEED"] + i), dummy_batch)
+        opt_state = optimizer.init(agent_params, jax.random.PRNGKey(config["SEED"] + i), extended_dummy_batch)
 
         reset_envs, rollout, train_chunk = make_task_fns(train_envs[i])
         key, reset_key = jax.random.split(key)
@@ -418,8 +518,8 @@ def single_run(config: dict):
                 save_and_eval(agent_params, i, global_step, is_end_of_task=False)
 
             chunk_start = time.perf_counter()
-            carry, agent_params, opt_state, global_step, (infos, (loss, pg_loss, v_loss, entropy_loss), learning_rate) = train_chunk(
-                carry, agent_params, opt_state, global_step
+            carry, agent_params, opt_state, global_step, (infos, (loss, pg_loss, v_loss, entropy_loss, cl_loss), learning_rate) = train_chunk(
+                carry, agent_params, opt_state, global_step, cl_state
             )
             task_prefix = f"{game}+{task_train_mods[i]}"
             # one wandb point per update of the chunk, not only its last one
@@ -431,6 +531,7 @@ def single_run(config: dict):
                 "losses/value_loss": v_loss,
                 "losses/policy_loss": pg_loss,
                 "losses/entropy": entropy_loss,
+                "losses/cl_loss": cl_loss,
                 "losses/loss": loss,
             }
             update_metrics = {k: np.asarray(v) for k, v in update_metrics.items()}
@@ -450,11 +551,13 @@ def single_run(config: dict):
                 f"[acktr_crl] task {i + 1} chunk {chunk + 1}/{num_chunks} | global_step {global_step} | "
                 f"avg_return {metrics['charts/avg_episodic_return']:.2f} | "
                 f"avg_length {metrics['charts/avg_episodic_length']:.2f} | "
-                f"loss {metrics['losses/loss']:.4f} | " # TODO: log cl_loss
+                f"loss {metrics['losses/loss']:.4f} | cl_loss {metrics['losses/cl_loss']:.4g} | "
                 f"SPS {metrics['charts/SPS']}"
             )
 
         eval_metrics = save_and_eval(agent_params, i, global_step, is_end_of_task=True)
+
+        cl_state = on_task_end(i, cl_state, agent_params, opt_state)
 
     wandb.finish()
     return eval_metrics

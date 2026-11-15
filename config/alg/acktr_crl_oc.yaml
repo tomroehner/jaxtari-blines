@@ -5,14 +5,14 @@ CAPTURE_VIDEO: False
 VIDEO_AT_END: True  # True: capture videos only at the end of training on a task
 
 EVAL_DURING_TRAIN: True
-EVAL_EVERY: 102
+EVAL_EVERY: 100
 EVAL_EPISODES: 10  # per seen task; BWT/FM are differences of evals
 
 PIXEL_BASED: False
 NATIVE_DOWNSCALING: True
 
 LEARNING_RATE: 1.0
-NUM_ENVS: 512
+NUM_ENVS: 16
 NUM_STEPS: 64
 SCAN_STEPS: 1  # updates per jitted chunk (one wandb log per update)
 ANNEAL_LR: True
@@ -28,7 +28,7 @@ MAX_GRAD_NORM: 0.001
 # =================================================================
 
 TASKS: [pong, pong, pong] # replaces ENV_ID
-TIMESTEPS_PER_TASK: 10000000  # replaces TOTAL_TIMESTEPS
+TIMESTEPS_PER_TASK: 1000000  # replaces TOTAL_TIMESTEPS
 
 # mods applied during training, one list per task
 TASK_TRAIN_MODS: 
@@ -41,3 +41,9 @@ TASK_EVAL_MODS:
   - [ [] ]
   - [ [lazy_enemy] ]
   - [ [shift_player] ]
+
+CL_METHOD: none  # none, ewc
+
+# EWC
+EWC_DECAY: 0.9  # Decay for Online EWC
+EWC_LAMBDA: 1000000.0  # Weight for EWC penalty
