@@ -204,7 +204,7 @@ def single_run(config: dict):
             f_delta = estimator.multiply(
                 state=cl_state["estimator_state"],  # includes all past tasks
                 parameter_structured_vector=delta,
-                identity_weight=0.0,    # no damping
+                identity_weight=1e-6,    # no damping
                 exact_power=True,       # only need F to the power of one anyways
                 use_cached=False,
                 pmap_axis_name=None,    # single device
@@ -343,6 +343,8 @@ def single_run(config: dict):
                     state=opt_state,
                     rng=update_key,
                     batch=extended_batch,
+                    prior_state=cl_state["estimator_state"] if cl_method == "ewc" else None,
+                    prior_weight=config["EWC_LAMBDA"],
                 )
                 
                 loss = stats.get('loss', jnp.array(0.0))
@@ -423,7 +425,8 @@ def single_run(config: dict):
             # videos only of the current task's envs
             capture_video = config.get("CAPTURE_VIDEO", False) and eval_game == game and eval_train_mods == train_mods
             if capture_video and (is_end_of_task or not config.get("VIDEO_AT_END", True)):
-                frames = jnp.transpose(jax.vmap(renderer.render)(env_states), (0, 3, 1, 2))
+                video_states = jax.tree.map(lambda x: x[: config.get("VIDEO_MAX_FRAMES")], env_states)
+                frames = jnp.transpose(jax.vmap(renderer.render)(video_states), (0, 3, 1, 2))
                 wandb.log({f"{eval_key}/eval/video": wandb.Video(np.array(frames), fps=30, format="mp4")}, step=step_count)
                 print(f"Video ({eval_key}/eval) logged to wandb with {frames.shape[0]} frames.")
 
@@ -482,7 +485,9 @@ def single_run(config: dict):
         params=dummy_params, 
         state=dummy_opt_state, 
         rng=jax.random.PRNGKey(0), 
-        batch=extended_dummy_batch
+        batch=extended_dummy_batch,
+        prior_state=jax.tree_util.tree_map(jnp.copy, dummy_opt_state.estimator_state) if cl_method == "ewc" else None,
+        prior_weight=config["EWC_LAMBDA"],
     )
 
     # --- train the tasks in sequence -----------------------------------------
@@ -499,6 +504,15 @@ def single_run(config: dict):
 
         # reset the optimizer state (step count & Kronecker Factor EMAs) for every new task
         opt_state = optimizer.init(agent_params, jax.random.PRNGKey(config["SEED"] + i), extended_dummy_batch)
+        if i > 0 and cl_method == "ewc":
+            copied_estimator_state = jax.tree.map(jnp.copy, cl_state["estimator_state"])
+            opt_state = type(opt_state)(
+                opt_state.velocities,
+                copied_estimator_state,
+                opt_state.damping,
+                opt_state.data_seen,
+                opt_state.step_counter
+            )
 
         reset_envs, rollout, train_chunk = make_task_fns(train_envs[i])
         key, reset_key = jax.random.split(key)

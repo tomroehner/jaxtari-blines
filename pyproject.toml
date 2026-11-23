@@ -21,7 +21,7 @@ viper = ["scikit-learn"]
 [tool.uv.sources]
 # local checkout (../JAXtari, kept on dev); editable so runs always use its current HEAD
 jaxtari = { path = "../JAXtari", editable = true }
-kfac-jax = { git = "https://github.com/google-deepmind/kfac-jax.git" }
+kfac-jax = { git = "https://github.com/tomroehner/kfac-jax.git", rev = "prior-curvature" }
 
 [tool.uv]
 override-dependencies = [
