@@ -204,7 +204,7 @@ def single_run(config: dict):
             f_delta = estimator.multiply(
                 state=cl_state["estimator_state"],  # includes all past tasks
                 parameter_structured_vector=delta,
-                identity_weight=1e-6,    # no damping
+                identity_weight=0.0,    # no damping
                 exact_power=True,       # only need F to the power of one anyways
                 use_cached=False,
                 pmap_axis_name=None,    # single device
@@ -490,6 +490,37 @@ def single_run(config: dict):
         prior_weight=config["EWC_LAMBDA"],
     )
 
+    def dump_curvature_eigenvalues(task_idx, cl_state, save_dir="diagnostics"):
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"eigenvalues_task_{task_idx}.npz")
+        
+        data = {}
+        estimator_state = cl_state["estimator_state"]
+        print(f"{'Block':<6} | {'Min Factor Eig':<16} | {'Min Kron Eig':<16} | {'Max Kron Eig':<16} | {'# Neg Kron Eigs'}")
+        print("-" * 75)
+        for b_idx, block_state in enumerate(estimator_state.blocks_states):
+            factor_eigs = []
+            for f_idx, factor in enumerate(block_state.factors):
+                # Symmetrize factor to eliminate numerical asymmetry
+                mat = np.array(factor.value)
+                sym = 0.5 * (mat + mat.T)
+                eigs = np.linalg.eigvalsh(sym)
+                data[f"block_{b_idx}_factor_{f_idx}_eigs"] = eigs
+                factor_eigs.append(eigs)
+            if len(factor_eigs) == 2:
+                # Eigenvalues of A ⊗ B are all pairwise products
+                kron_eigs = np.outer(factor_eigs[0], factor_eigs[1]).flatten()
+                data[f"block_{b_idx}_kron_eigs"] = kron_eigs
+                
+                min_factor_eig = min(factor_eigs[0].min(), factor_eigs[1].min())
+                min_kron = kron_eigs.min()
+                max_kron = kron_eigs.max()
+                num_neg = np.sum(kron_eigs < 0)
+                
+                print(f"{b_idx:<6} | {min_factor_eig:+.4e}        | {min_kron:+.4e}        | {max_kron:+.4e}        | {num_neg}/{len(kron_eigs)}")
+        np.savez_compressed(save_path, **data)
+        print(f"[Diagnostic] Saved full spectrum to: {save_path}\n")
+
     # --- train the tasks in sequence -----------------------------------------
     rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=num_chunks * num_tasks)
     rtpt.start()
@@ -572,6 +603,13 @@ def single_run(config: dict):
         eval_metrics = save_and_eval(agent_params, i, global_step, is_end_of_task=True)
 
         cl_state = on_task_end(i, cl_state, agent_params, opt_state)
+
+        if cl_method == "ewc":
+            dump_curvature_eigenvalues(
+                task_idx=i,
+                cl_state=cl_state,
+                save_dir=f"diagnostics/{config['EXP_NAME']}_seed_{config['SEED']}"
+            )
 
     wandb.finish()
     return eval_metrics
